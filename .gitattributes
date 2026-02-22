@@ -1,0 +1,2 @@
+﻿# Ensure bash scripts run correctly in Linux pods (no CRLF)
+*.sh text eol=lf
