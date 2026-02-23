@@ -1,4 +1,4 @@
-﻿fastapi==0.110.0
+fastapi==0.110.0
 uvicorn[standard]==0.27.1
 pydantic==2.6.4
 python-multipart==0.0.9
@@ -8,3 +8,11 @@ diffusers==0.30.3
 transformers==4.44.2
 accelerate==0.33.0
 safetensors==0.4.4
+
+# Optional: control preprocessing (canny/depth/lineart/openpose)
+numpy
+opencv-python-headless
+controlnet-aux
+
+# Optional: cleanup remove_bg (alpha cutout)
+rembg

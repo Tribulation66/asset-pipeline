@@ -7,7 +7,7 @@ import threading
 import queue
 import urllib.request
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import torch
 from PIL import Image
@@ -31,6 +31,12 @@ _out_dir.mkdir(parents=True, exist_ok=True)
 _pipe_t2i = None
 _pipe_i2i = None
 _pipe_inpaint = None
+
+# ControlNet caches
+_controlnets: Dict[str, Any] = {}
+_pipe_t2i_cn: Dict[tuple, Any] = {}
+_pipe_i2i_cn: Dict[tuple, Any] = {}
+_pipe_inpaint_cn: Dict[tuple, Any] = {}
 
 _jobs: Dict[str, Dict[str, Any]] = {}
 _q: "queue.Queue[str]" = queue.Queue()
@@ -150,6 +156,233 @@ def _downscale_max(img: Image.Image, max_size: int) -> Image.Image:
     return img.resize((nw, nh), resample=Image.LANCZOS)
 
 
+# ----------------------------
+# Conditioning plumbing
+# ----------------------------
+class ImageRef(BaseModel):
+    url: Optional[str] = None
+    b64: Optional[str] = None
+
+
+class ControlInput(BaseModel):
+    # Generic and composable. Provide a model_id per control.
+    # type: openpose / canny / depth / lineart / silhouette
+    type: str
+    model_id: Optional[str] = None
+
+    image_url: Optional[str] = None
+    image_b64: Optional[str] = None
+
+    weight: float = 1.0
+    start: float = 0.0
+    end: float = 1.0
+
+    preprocess: bool = False
+    processor_params: Optional[Dict[str, Any]] = None
+
+
+class IdentityConditioning(BaseModel):
+    # No-op placeholder layer (stores metadata for later InstantID/PhotoMaker).
+    refs: List[ImageRef] = []
+    strength: float = 1.0
+    method: Optional[str] = None
+    params: Optional[Dict[str, Any]] = None
+
+
+class ConditioningLayer(BaseModel):
+    control_inputs: Optional[List[ControlInput]] = None
+    identity: Optional[IdentityConditioning] = None
+
+
+def _load_imgref(url: Optional[str], b64: Optional[str]) -> Image.Image:
+    if (url is None) == (b64 is None):
+        raise ValueError("provide exactly one of *_url or *_b64")
+    img = _load_pil_from_url(url) if url else _load_pil_from_b64(b64)
+    return img
+
+
+def _preprocess_control(ci: ControlInput, src_rgba: Image.Image, width: int, height: int) -> Image.Image:
+    """
+    Returns an RGB control map resized to (width,height).
+    If preprocess=False, treats input image as already-a-control-map.
+    If preprocess=True, tries to generate a map based on ci.type.
+    """
+    params = ci.processor_params or {}
+
+    if not ci.preprocess:
+        return _prepare_image(src_rgba, width, height)
+
+    t = (ci.type or "").lower()
+
+    if t == "silhouette":
+        rgba = src_rgba.convert("RGBA")
+        if rgba.size != (width, height):
+            rgba = rgba.resize((width, height), resample=Image.LANCZOS)
+        alpha = rgba.split()[-1]
+        thr = int(params.get("alpha_threshold", 10))
+        mask = alpha.point(lambda a: 255 if a > thr else 0).convert("L")
+        return mask.convert("RGB")
+
+    if t == "canny":
+        try:
+            import numpy as np
+            import cv2
+        except Exception as e:
+            raise RuntimeError(f"canny preprocess requires numpy + opencv-python-headless: {e}")
+        rgb = _prepare_image(src_rgba, width, height)
+        arr = np.array(rgb)
+        low = int(params.get("low_threshold", 100))
+        high = int(params.get("high_threshold", 200))
+        edges = cv2.Canny(arr, low, high)
+        edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+        return Image.fromarray(edges_rgb)
+
+    if t in ("depth", "lineart", "openpose"):
+        try:
+            from controlnet_aux import MidasDetector, LineartDetector, OpenposeDetector
+        except Exception as e:
+            raise RuntimeError(f"{t} preprocess requires controlnet-aux: {e}")
+
+        rgb = _prepare_image(src_rgba, width, height)
+
+        if t == "depth":
+            det = MidasDetector.from_pretrained("Intel/dpt-hybrid-midas")
+            out = det(rgb)
+            return out.convert("RGB")
+        if t == "lineart":
+            det = LineartDetector.from_pretrained("lllyasviel/Annotators")
+            out = det(rgb)
+            return out.convert("RGB")
+        if t == "openpose":
+            det = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
+            out = det(rgb)
+            return out.convert("RGB")
+
+    raise ValueError(f"unknown control type: {ci.type}")
+
+
+def _load_controlnet_once(model_id: str):
+    if model_id in _controlnets:
+        return _controlnets[model_id]
+
+    try:
+        from diffusers import ControlNetModel
+    except Exception as e:
+        raise RuntimeError(f"diffusers ControlNetModel not available: {e}")
+
+    kwargs = {"torch_dtype": DTYPE, "use_safetensors": True}
+    # Try fp16 variant when on CUDA
+    if DTYPE == torch.float16:
+        try:
+            cn = ControlNetModel.from_pretrained(model_id, variant="fp16", **kwargs).to(DEVICE)
+        except Exception:
+            cn = ControlNetModel.from_pretrained(model_id, **kwargs).to(DEVICE)
+    else:
+        cn = ControlNetModel.from_pretrained(model_id, **kwargs).to(DEVICE)
+
+    _controlnets[model_id] = cn
+    return cn
+
+
+def _get_cn_pipe(task: str, model_ids: List[str]):
+    """
+    task: txt2img / img2img / inpaint
+    model_ids order matters and must match control_images/scales order.
+    """
+    key = tuple(model_ids)
+
+    if task == "txt2img" and key in _pipe_t2i_cn:
+        return _pipe_t2i_cn[key]
+    if task == "img2img" and key in _pipe_i2i_cn:
+        return _pipe_i2i_cn[key]
+    if task == "inpaint" and key in _pipe_inpaint_cn:
+        return _pipe_inpaint_cn[key]
+
+    try:
+        from diffusers import (
+            MultiControlNetModel,
+            StableDiffusionXLControlNetPipeline,
+            StableDiffusionXLControlNetImg2ImgPipeline,
+            StableDiffusionXLControlNetInpaintPipeline,
+        )
+    except Exception as e:
+        raise RuntimeError(f"SDXL ControlNet pipelines not available in your diffusers install: {e}")
+
+    cns = [_load_controlnet_once(mid) for mid in model_ids]
+    controlnet = cns[0] if len(cns) == 1 else MultiControlNetModel(cns)
+
+    if task == "txt2img":
+        _load_t2i_once()
+        try:
+            pipe = StableDiffusionXLControlNetPipeline.from_pipe(_pipe_t2i, controlnet=controlnet).to(DEVICE)
+        except Exception:
+            # Fallback: load directly from base
+            kwargs = {"torch_dtype": DTYPE, "use_safetensors": True}
+            if DTYPE == torch.float16:
+                try:
+                    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(MODEL_BASE, controlnet=controlnet, variant="fp16", **kwargs).to(DEVICE)
+                except Exception:
+                    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(MODEL_BASE, controlnet=controlnet, **kwargs).to(DEVICE)
+            else:
+                pipe = StableDiffusionXLControlNetPipeline.from_pretrained(MODEL_BASE, controlnet=controlnet, **kwargs).to(DEVICE)
+
+        _try_enable_xformers(pipe)
+        _pipe_t2i_cn[key] = pipe
+        return pipe
+
+    if task == "img2img":
+        _load_i2i_once()
+        try:
+            pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pipe(_pipe_i2i, controlnet=controlnet).to(DEVICE)
+        except Exception:
+            kwargs = {"torch_dtype": DTYPE, "use_safetensors": True}
+            if DTYPE == torch.float16:
+                try:
+                    pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(MODEL_BASE, controlnet=controlnet, variant="fp16", **kwargs).to(DEVICE)
+                except Exception:
+                    pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(MODEL_BASE, controlnet=controlnet, **kwargs).to(DEVICE)
+            else:
+                pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(MODEL_BASE, controlnet=controlnet, **kwargs).to(DEVICE)
+
+        _try_enable_xformers(pipe)
+        _pipe_i2i_cn[key] = pipe
+        return pipe
+
+    if task == "inpaint":
+        _load_inpaint_once()
+        try:
+            pipe = StableDiffusionXLControlNetInpaintPipeline.from_pipe(_pipe_inpaint, controlnet=controlnet).to(DEVICE)
+        except Exception:
+            kwargs = {"torch_dtype": DTYPE, "use_safetensors": True}
+            if DTYPE == torch.float16:
+                try:
+                    pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(MODEL_INPAINT, controlnet=controlnet, variant="fp16", **kwargs).to(DEVICE)
+                except Exception:
+                    pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(MODEL_INPAINT, controlnet=controlnet, **kwargs).to(DEVICE)
+            else:
+                pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(MODEL_INPAINT, controlnet=controlnet, **kwargs).to(DEVICE)
+
+        _try_enable_xformers(pipe)
+        _pipe_inpaint_cn[key] = pipe
+        return pipe
+
+    raise ValueError(f"unknown task: {task}")
+
+
+def _identity_meta(identity: Optional[IdentityConditioning]) -> Optional[Dict[str, Any]]:
+    if identity is None:
+        return None
+    return {
+        "strength": identity.strength,
+        "method": identity.method,
+        "params": identity.params or {},
+        "num_refs": len(identity.refs or []),
+    }
+
+
+# ----------------------------
+# Requests
+# ----------------------------
 class Txt2ImgRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
@@ -158,6 +391,8 @@ class Txt2ImgRequest(BaseModel):
     steps: int = 30
     guidance: float = 5.0
     seed: Optional[int] = None
+
+    conditioning: Optional[ConditioningLayer] = None
 
 
 class Img2ImgRequest(BaseModel):
@@ -173,6 +408,8 @@ class Img2ImgRequest(BaseModel):
     guidance: float = 5.0
     strength: float = 0.6
     seed: Optional[int] = None
+
+    conditioning: Optional[ConditioningLayer] = None
 
 
 class InpaintRequest(BaseModel):
@@ -192,6 +429,8 @@ class InpaintRequest(BaseModel):
     strength: float = 0.75
     seed: Optional[int] = None
 
+    conditioning: Optional[ConditioningLayer] = None
+
 
 class CleanupRequest(BaseModel):
     image_url: Optional[str] = None
@@ -206,101 +445,248 @@ class CleanupRequest(BaseModel):
 
 
 def _run_txt2img(job_id: str, req: Txt2ImgRequest):
-    _load_t2i_once()
-
     gen = None
     if req.seed is not None:
         gen = torch.Generator(device=DEVICE).manual_seed(req.seed)
 
-    out = _pipe_t2i(
-        prompt=req.prompt,
-        negative_prompt=req.negative_prompt,
-        width=req.width,
-        height=req.height,
-        num_inference_steps=req.steps,
-        guidance_scale=req.guidance,
-        generator=gen,
-    )
+    meta: Dict[str, Any] = {}
+    controls = (req.conditioning.control_inputs if req.conditioning and req.conditioning.control_inputs else []) or []
+    identity = req.conditioning.identity if req.conditioning else None
+    imeta = _identity_meta(identity)
+    if imeta:
+        meta["identity"] = imeta
+
+    if not controls:
+        _load_t2i_once()
+        out = _pipe_t2i(
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            width=req.width,
+            height=req.height,
+            num_inference_steps=req.steps,
+            guidance_scale=req.guidance,
+            generator=gen,
+        )
+    else:
+        # ControlNet path
+        model_ids: List[str] = []
+        control_images: List[Image.Image] = []
+        scales: List[float] = []
+        starts: List[float] = []
+        ends: List[float] = []
+
+        for ci in controls:
+            if not ci.model_id:
+                raise ValueError("each control_inputs item requires model_id")
+            model_ids.append(ci.model_id)
+            if (ci.image_url is None) == (ci.image_b64 is None):
+                raise ValueError("txt2img control_inputs requires exactly one of image_url or image_b64 per control")
+            src = _load_imgref(ci.image_url, ci.image_b64)
+            cmap = _preprocess_control(ci, src, req.width, req.height)
+            control_images.append(cmap)
+            scales.append(float(ci.weight))
+            starts.append(float(ci.start))
+            ends.append(float(ci.end))
+
+        pipe = _get_cn_pipe("txt2img", model_ids)
+
+        out = pipe(
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            width=req.width,
+            height=req.height,
+            num_inference_steps=req.steps,
+            guidance_scale=req.guidance,
+            generator=gen,
+            image=control_images if len(control_images) > 1 else control_images[0],
+            controlnet_conditioning_scale=scales if len(scales) > 1 else scales[0],
+            control_guidance_start=starts if len(starts) > 1 else starts[0],
+            control_guidance_end=ends if len(ends) > 1 else ends[0],
+        )
+
+        meta["controls"] = [{"type": c.type, "model_id": c.model_id, "weight": c.weight, "start": c.start, "end": c.end, "preprocess": c.preprocess} for c in controls]
 
     png_path = _out_dir / f"{job_id}.png"
     out.images[0].save(png_path, format="PNG")
-    return png_path
+    return png_path, meta
 
 
 def _run_img2img(job_id: str, req: Img2ImgRequest):
-    _load_i2i_once()
-
     if (req.init_image_url is None) == (req.init_image_b64 is None):
         raise ValueError("provide exactly one of init_image_url or init_image_b64")
 
-    init_img = _load_pil_from_url(req.init_image_url) if req.init_image_url else _load_pil_from_b64(req.init_image_b64)
-    init_img = _prepare_image(init_img, req.width, req.height)
+    init_rgba = _load_imgref(req.init_image_url, req.init_image_b64).convert("RGBA")
+    init_img = _prepare_image(init_rgba, req.width, req.height)
 
     gen = None
     if req.seed is not None:
         gen = torch.Generator(device=DEVICE).manual_seed(req.seed)
 
-    out = _pipe_i2i(
-        prompt=req.prompt,
-        negative_prompt=req.negative_prompt,
-        image=init_img,
-        num_inference_steps=req.steps,
-        guidance_scale=req.guidance,
-        strength=req.strength,
-        generator=gen,
-    )
+    meta: Dict[str, Any] = {}
+    controls = (req.conditioning.control_inputs if req.conditioning and req.conditioning.control_inputs else []) or []
+    identity = req.conditioning.identity if req.conditioning else None
+    imeta = _identity_meta(identity)
+    if imeta:
+        meta["identity"] = imeta
+
+    if not controls:
+        _load_i2i_once()
+        out = _pipe_i2i(
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            image=init_img,
+            num_inference_steps=req.steps,
+            guidance_scale=req.guidance,
+            strength=req.strength,
+            generator=gen,
+        )
+    else:
+        model_ids: List[str] = []
+        control_images: List[Image.Image] = []
+        scales: List[float] = []
+        starts: List[float] = []
+        ends: List[float] = []
+
+        for ci in controls:
+            if not ci.model_id:
+                raise ValueError("each control_inputs item requires model_id")
+            model_ids.append(ci.model_id)
+
+            # If control image omitted and preprocess=True, use init image as source.
+            if ci.image_url is None and ci.image_b64 is None:
+                if not ci.preprocess:
+                    raise ValueError("img2img control_inputs requires image_url/image_b64 unless preprocess=true")
+                src = init_rgba
+            else:
+                src = _load_imgref(ci.image_url, ci.image_b64)
+
+            cmap = _preprocess_control(ci, src, req.width, req.height)
+            control_images.append(cmap)
+            scales.append(float(ci.weight))
+            starts.append(float(ci.start))
+            ends.append(float(ci.end))
+
+        pipe = _get_cn_pipe("img2img", model_ids)
+
+        out = pipe(
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            image=init_img,
+            num_inference_steps=req.steps,
+            guidance_scale=req.guidance,
+            strength=req.strength,
+            generator=gen,
+            control_image=control_images if len(control_images) > 1 else control_images[0],
+            controlnet_conditioning_scale=scales if len(scales) > 1 else scales[0],
+            control_guidance_start=starts if len(starts) > 1 else starts[0],
+            control_guidance_end=ends if len(ends) > 1 else ends[0],
+        )
+
+        meta["controls"] = [{"type": c.type, "model_id": c.model_id, "weight": c.weight, "start": c.start, "end": c.end, "preprocess": c.preprocess} for c in controls]
 
     png_path = _out_dir / f"{job_id}.png"
     out.images[0].save(png_path, format="PNG")
-    return png_path
+    return png_path, meta
 
 
 def _run_inpaint(job_id: str, req: InpaintRequest):
-    _load_inpaint_once()
-
     if (req.init_image_url is None) == (req.init_image_b64 is None):
         raise ValueError("provide exactly one of init_image_url or init_image_b64")
     if (req.mask_image_url is None) == (req.mask_image_b64 is None):
         raise ValueError("provide exactly one of mask_image_url or mask_image_b64")
 
-    init_img = _load_pil_from_url(req.init_image_url) if req.init_image_url else _load_pil_from_b64(req.init_image_b64)
-    mask_img = _load_pil_from_url(req.mask_image_url) if req.mask_image_url else _load_pil_from_b64(req.mask_image_b64)
+    init_rgba = _load_imgref(req.init_image_url, req.init_image_b64).convert("RGBA")
+    init_img = _prepare_image(init_rgba, req.width, req.height)
 
-    init_img = _prepare_image(init_img, req.width, req.height)
+    mask_img = _load_imgref(req.mask_image_url, req.mask_image_b64)
     mask_img = _prepare_mask(mask_img, req.width, req.height)
 
     gen = None
     if req.seed is not None:
         gen = torch.Generator(device=DEVICE).manual_seed(req.seed)
 
-    out = _pipe_inpaint(
-        prompt=req.prompt,
-        negative_prompt=req.negative_prompt,
-        image=init_img,
-        mask_image=mask_img,
-        num_inference_steps=req.steps,
-        guidance_scale=req.guidance,
-        strength=req.strength,
-        generator=gen,
-    )
+    meta: Dict[str, Any] = {}
+    controls = (req.conditioning.control_inputs if req.conditioning and req.conditioning.control_inputs else []) or []
+    identity = req.conditioning.identity if req.conditioning else None
+    imeta = _identity_meta(identity)
+    if imeta:
+        meta["identity"] = imeta
+
+    if not controls:
+        _load_inpaint_once()
+        out = _pipe_inpaint(
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            image=init_img,
+            mask_image=mask_img,
+            num_inference_steps=req.steps,
+            guidance_scale=req.guidance,
+            strength=req.strength,
+            generator=gen,
+        )
+    else:
+        model_ids: List[str] = []
+        control_images: List[Image.Image] = []
+        scales: List[float] = []
+        starts: List[float] = []
+        ends: List[float] = []
+
+        for ci in controls:
+            if not ci.model_id:
+                raise ValueError("each control_inputs item requires model_id")
+            model_ids.append(ci.model_id)
+
+            if ci.image_url is None and ci.image_b64 is None:
+                if not ci.preprocess:
+                    raise ValueError("inpaint control_inputs requires image_url/image_b64 unless preprocess=true")
+                src = init_rgba
+            else:
+                src = _load_imgref(ci.image_url, ci.image_b64)
+
+            cmap = _preprocess_control(ci, src, req.width, req.height)
+            control_images.append(cmap)
+            scales.append(float(ci.weight))
+            starts.append(float(ci.start))
+            ends.append(float(ci.end))
+
+        pipe = _get_cn_pipe("inpaint", model_ids)
+
+        out = pipe(
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            image=init_img,
+            mask_image=mask_img,
+            num_inference_steps=req.steps,
+            guidance_scale=req.guidance,
+            strength=req.strength,
+            generator=gen,
+            control_image=control_images if len(control_images) > 1 else control_images[0],
+            controlnet_conditioning_scale=scales if len(scales) > 1 else scales[0],
+            control_guidance_start=starts if len(starts) > 1 else starts[0],
+            control_guidance_end=ends if len(ends) > 1 else ends[0],
+        )
+
+        meta["controls"] = [{"type": c.type, "model_id": c.model_id, "weight": c.weight, "start": c.start, "end": c.end, "preprocess": c.preprocess} for c in controls]
 
     png_path = _out_dir / f"{job_id}.png"
     out.images[0].save(png_path, format="PNG")
-    return png_path
+    return png_path, meta
 
 
 def _run_cleanup(job_id: str, req: CleanupRequest):
     if (req.image_url is None) == (req.image_b64 is None):
         raise ValueError("provide exactly one of image_url or image_b64")
 
-    img = _load_pil_from_url(req.image_url) if req.image_url else _load_pil_from_b64(req.image_b64)
-    img = img.convert("RGBA")
+    img = _load_imgref(req.image_url, req.image_b64).convert("RGBA")
     img = _downscale_max(img, req.max_size)
+
+    meta: Dict[str, Any] = {"mode": req.mode}
 
     if req.mode == "solid_bg":
         r, g, b = _hex_to_rgb(req.bg_color)
         bg = Image.new("RGBA", img.size, (r, g, b, 255))
         out = Image.alpha_composite(bg, img).convert("RGB")
+        meta["bg_color"] = req.bg_color
     elif req.mode == "remove_bg":
         try:
             from rembg import remove
@@ -315,7 +701,7 @@ def _run_cleanup(job_id: str, req: CleanupRequest):
 
     png_path = _out_dir / f"{job_id}.png"
     out.save(png_path, format="PNG")
-    return png_path
+    return png_path, meta
 
 
 def _run_job(job_id: str):
@@ -331,15 +717,16 @@ def _run_job(job_id: str):
             _jobs[job_id]["status"] = "running"
             _jobs[job_id]["started_at"] = time.time()
 
+        # GPU serialize (keeps VRAM stable). cleanup is cheap but kept serialized for simplicity.
         with _gpu_lock:
             if kind == "txt2img":
-                png_path = _run_txt2img(job_id, req)
+                png_path, meta = _run_txt2img(job_id, req)
             elif kind == "img2img":
-                png_path = _run_img2img(job_id, req)
+                png_path, meta = _run_img2img(job_id, req)
             elif kind == "inpaint":
-                png_path = _run_inpaint(job_id, req)
+                png_path, meta = _run_inpaint(job_id, req)
             elif kind == "cleanup":
-                png_path = _run_cleanup(job_id, req)
+                png_path, meta = _run_cleanup(job_id, req)
             else:
                 raise ValueError(f"unknown job kind: {kind}")
 
@@ -347,6 +734,7 @@ def _run_job(job_id: str):
             _jobs[job_id]["status"] = "done"
             _jobs[job_id]["finished_at"] = time.time()
             _jobs[job_id]["png_path"] = str(png_path)
+            _jobs[job_id]["meta"] = meta
 
     except Exception as e:
         with _lock:
@@ -372,7 +760,13 @@ def _ensure_worker():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "device": DEVICE, "model": MODEL_BASE, "inpaint_model": MODEL_INPAINT}
+    return {
+        "ok": True,
+        "device": DEVICE,
+        "model": MODEL_BASE,
+        "inpaint_model": MODEL_INPAINT,
+        "dtype": str(DTYPE),
+    }
 
 
 @app.post("/txt2img_job")
