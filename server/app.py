@@ -14,7 +14,7 @@ from PIL import Image
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from diffusers import AutoPipelineForText2Image, AutoPipelineForInpainting
+from diffusers import AutoPipelineForText2Image, AutoPipelineForInpainting, AutoPipelineForImage2Image
 
 app = FastAPI(title="asset-pipeline image service")
 
@@ -29,6 +29,7 @@ _out_dir = _repo_root / "outputs"
 _out_dir.mkdir(parents=True, exist_ok=True)
 
 _pipe_t2i = None
+_pipe_i2i = None
 _pipe_inpaint = None
 
 _jobs: Dict[str, Dict[str, Any]] = {}
@@ -62,6 +63,23 @@ def _load_t2i_once():
         _pipe_t2i = AutoPipelineForText2Image.from_pretrained(MODEL_BASE, **kwargs).to(DEVICE)
 
     _try_enable_xformers(_pipe_t2i)
+
+
+def _load_i2i_once():
+    global _pipe_i2i
+    if _pipe_i2i is not None:
+        return
+
+    kwargs = {"torch_dtype": DTYPE}
+    if DTYPE == torch.float16:
+        try:
+            _pipe_i2i = AutoPipelineForImage2Image.from_pretrained(MODEL_BASE, variant="fp16", **kwargs).to(DEVICE)
+        except Exception:
+            _pipe_i2i = AutoPipelineForImage2Image.from_pretrained(MODEL_BASE, **kwargs).to(DEVICE)
+    else:
+        _pipe_i2i = AutoPipelineForImage2Image.from_pretrained(MODEL_BASE, **kwargs).to(DEVICE)
+
+    _try_enable_xformers(_pipe_i2i)
 
 
 def _load_inpaint_once():
@@ -114,6 +132,24 @@ def _prepare_mask(mask: Image.Image, width: int, height: int) -> Image.Image:
     return mask
 
 
+def _hex_to_rgb(hex_color: str):
+    h = hex_color.strip().lstrip("#")
+    if len(h) != 6:
+        raise ValueError("bg_color must be #RRGGBB")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _downscale_max(img: Image.Image, max_size: int) -> Image.Image:
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_size:
+        return img
+    scale = max_size / float(m)
+    nw = max(1, int(w * scale))
+    nh = max(1, int(h * scale))
+    return img.resize((nw, nh), resample=Image.LANCZOS)
+
+
 class Txt2ImgRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
@@ -121,6 +157,21 @@ class Txt2ImgRequest(BaseModel):
     height: int = 1024
     steps: int = 30
     guidance: float = 5.0
+    seed: Optional[int] = None
+
+
+class Img2ImgRequest(BaseModel):
+    prompt: str
+    negative_prompt: Optional[str] = None
+
+    init_image_url: Optional[str] = None
+    init_image_b64: Optional[str] = None
+
+    width: int = 1024
+    height: int = 1024
+    steps: int = 30
+    guidance: float = 5.0
+    strength: float = 0.6
     seed: Optional[int] = None
 
 
@@ -142,6 +193,18 @@ class InpaintRequest(BaseModel):
     seed: Optional[int] = None
 
 
+class CleanupRequest(BaseModel):
+    image_url: Optional[str] = None
+    image_b64: Optional[str] = None
+
+    # "solid_bg" = composite on a solid background for Trellis readiness
+    # "remove_bg" = alpha cutout (requires rembg installed later)
+    mode: str = "solid_bg"
+
+    bg_color: str = "#FFFFFF"
+    max_size: int = 2048
+
+
 def _run_txt2img(job_id: str, req: Txt2ImgRequest):
     _load_t2i_once()
 
@@ -156,6 +219,34 @@ def _run_txt2img(job_id: str, req: Txt2ImgRequest):
         height=req.height,
         num_inference_steps=req.steps,
         guidance_scale=req.guidance,
+        generator=gen,
+    )
+
+    png_path = _out_dir / f"{job_id}.png"
+    out.images[0].save(png_path, format="PNG")
+    return png_path
+
+
+def _run_img2img(job_id: str, req: Img2ImgRequest):
+    _load_i2i_once()
+
+    if (req.init_image_url is None) == (req.init_image_b64 is None):
+        raise ValueError("provide exactly one of init_image_url or init_image_b64")
+
+    init_img = _load_pil_from_url(req.init_image_url) if req.init_image_url else _load_pil_from_b64(req.init_image_b64)
+    init_img = _prepare_image(init_img, req.width, req.height)
+
+    gen = None
+    if req.seed is not None:
+        gen = torch.Generator(device=DEVICE).manual_seed(req.seed)
+
+    out = _pipe_i2i(
+        prompt=req.prompt,
+        negative_prompt=req.negative_prompt,
+        image=init_img,
+        num_inference_steps=req.steps,
+        guidance_scale=req.guidance,
+        strength=req.strength,
         generator=gen,
     )
 
@@ -198,6 +289,35 @@ def _run_inpaint(job_id: str, req: InpaintRequest):
     return png_path
 
 
+def _run_cleanup(job_id: str, req: CleanupRequest):
+    if (req.image_url is None) == (req.image_b64 is None):
+        raise ValueError("provide exactly one of image_url or image_b64")
+
+    img = _load_pil_from_url(req.image_url) if req.image_url else _load_pil_from_b64(req.image_b64)
+    img = img.convert("RGBA")
+    img = _downscale_max(img, req.max_size)
+
+    if req.mode == "solid_bg":
+        r, g, b = _hex_to_rgb(req.bg_color)
+        bg = Image.new("RGBA", img.size, (r, g, b, 255))
+        out = Image.alpha_composite(bg, img).convert("RGB")
+    elif req.mode == "remove_bg":
+        try:
+            from rembg import remove
+        except Exception as e:
+            raise RuntimeError(f"remove_bg requires rembg to be installed: {e}")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        out_bytes = remove(buf.getvalue())
+        out = Image.open(io.BytesIO(out_bytes)).convert("RGBA")
+    else:
+        raise ValueError("mode must be solid_bg or remove_bg")
+
+    png_path = _out_dir / f"{job_id}.png"
+    out.save(png_path, format="PNG")
+    return png_path
+
+
 def _run_job(job_id: str):
     with _lock:
         j = _jobs.get(job_id)
@@ -214,8 +334,12 @@ def _run_job(job_id: str):
         with _gpu_lock:
             if kind == "txt2img":
                 png_path = _run_txt2img(job_id, req)
+            elif kind == "img2img":
+                png_path = _run_img2img(job_id, req)
             elif kind == "inpaint":
                 png_path = _run_inpaint(job_id, req)
+            elif kind == "cleanup":
+                png_path = _run_cleanup(job_id, req)
             else:
                 raise ValueError(f"unknown job kind: {kind}")
 
@@ -261,12 +385,32 @@ def txt2img_job(req: Txt2ImgRequest):
     return {"job_id": job_id, "status": "queued"}
 
 
+@app.post("/img2img_job")
+def img2img_job(req: Img2ImgRequest):
+    _ensure_worker()
+    job_id = uuid.uuid4().hex
+    with _lock:
+        _jobs[job_id] = {"kind": "img2img", "status": "queued", "created_at": time.time(), "request": req}
+    _q.put(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
 @app.post("/inpaint_job")
 def inpaint_job(req: InpaintRequest):
     _ensure_worker()
     job_id = uuid.uuid4().hex
     with _lock:
         _jobs[job_id] = {"kind": "inpaint", "status": "queued", "created_at": time.time(), "request": req}
+    _q.put(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/cleanup_job")
+def cleanup_job(req: CleanupRequest):
+    _ensure_worker()
+    job_id = uuid.uuid4().hex
+    with _lock:
+        _jobs[job_id] = {"kind": "cleanup", "status": "queued", "created_at": time.time(), "request": req}
     _q.put(job_id)
     return {"job_id": job_id, "status": "queued"}
 
