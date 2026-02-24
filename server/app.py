@@ -13,7 +13,7 @@ import torch
 from PIL import Image
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from diffusers import AutoPipelineForText2Image, AutoPipelineForInpainting, AutoPipelineForImage2Image
 
 app = FastAPI(title="asset-pipeline image service")
@@ -23,6 +23,9 @@ MODEL_INPAINT = os.getenv("SDXL_INPAINT", "diffusers/stable-diffusion-xl-1.0-inp
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+
+DEFAULT_WIDTH = int(os.getenv("DEFAULT_WIDTH", "960"))
+DEFAULT_HEIGHT = int(os.getenv("DEFAULT_HEIGHT", "640"))
 
 _repo_root = Path(__file__).resolve().parents[1]
 _out_dir = _repo_root / "outputs"
@@ -165,6 +168,7 @@ class ImageRef(BaseModel):
 
 
 class ControlInput(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
     # Generic and composable. Provide a model_id per control.
     # type: openpose / canny / depth / lineart / silhouette
     type: str
@@ -192,6 +196,27 @@ class IdentityConditioning(BaseModel):
 class ConditioningLayer(BaseModel):
     control_inputs: Optional[List[ControlInput]] = None
     identity: Optional[IdentityConditioning] = None
+
+
+
+# ControlNet default model IDs (env-overridable)
+CN_DEFAULT_CANNY      = os.getenv("CN_DEFAULT_CANNY",      "diffusers/controlnet-canny-sdxl-1.0")
+CN_DEFAULT_DEPTH      = os.getenv("CN_DEFAULT_DEPTH",      "diffusers/controlnet-depth-sdxl-1.0")
+CN_DEFAULT_OPENPOSE   = os.getenv("CN_DEFAULT_OPENPOSE",   "xinsir/controlnet-openpose-sdxl-1.0")
+CN_DEFAULT_LINEART    = os.getenv("CN_DEFAULT_LINEART",    "")
+CN_DEFAULT_SILHOUETTE = os.getenv("CN_DEFAULT_SILHOUETTE", CN_DEFAULT_CANNY)
+
+def _default_controlnet_id(control_type: str):
+    t = (control_type or "").lower()
+    mapping = {
+        "canny":      CN_DEFAULT_CANNY,
+        "depth":      CN_DEFAULT_DEPTH,
+        "openpose":   CN_DEFAULT_OPENPOSE,
+        "lineart":    (CN_DEFAULT_LINEART or None),
+        # silhouette maps are binary edges/masks; defaulting to canny CN is a practical baseline
+        "silhouette": CN_DEFAULT_SILHOUETTE,
+    }
+    return mapping.get(t)
 
 
 def _load_imgref(url: Optional[str], b64: Optional[str]) -> Image.Image:
@@ -247,16 +272,22 @@ def _preprocess_control(ci: ControlInput, src_rgba: Image.Image, width: int, hei
 
         if t == "depth":
             det = MidasDetector.from_pretrained("Intel/dpt-hybrid-midas")
-            out = det(rgb)
-            return out.convert("RGB")
+            out = det(rgb).convert("RGB")
+            if out.size != (width, height):
+                out = out.resize((width, height), resample=Image.LANCZOS)
+            return out
         if t == "lineart":
             det = LineartDetector.from_pretrained("lllyasviel/Annotators")
-            out = det(rgb)
-            return out.convert("RGB")
+            out = det(rgb).convert("RGB")
+            if out.size != (width, height):
+                out = out.resize((width, height), resample=Image.LANCZOS)
+            return out
         if t == "openpose":
             det = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
-            out = det(rgb)
-            return out.convert("RGB")
+            out = det(rgb).convert("RGB")
+            if out.size != (width, height):
+                out = out.resize((width, height), resample=Image.LANCZOS)
+            return out
 
     raise ValueError(f"unknown control type: {ci.type}")
 
@@ -270,15 +301,31 @@ def _load_controlnet_once(model_id: str):
     except Exception as e:
         raise RuntimeError(f"diffusers ControlNetModel not available: {e}")
 
-    kwargs = {"torch_dtype": DTYPE, "use_safetensors": True}
-    # Try fp16 variant when on CUDA
-    if DTYPE == torch.float16:
-        try:
-            cn = ControlNetModel.from_pretrained(model_id, variant="fp16", **kwargs).to(DEVICE)
-        except Exception:
-            cn = ControlNetModel.from_pretrained(model_id, **kwargs).to(DEVICE)
-    else:
-        cn = ControlNetModel.from_pretrained(model_id, **kwargs).to(DEVICE)
+    def _try_load(use_safetensors: bool):
+
+        kwargs = {"torch_dtype": DTYPE, "use_safetensors": use_safetensors}
+
+        if DTYPE == torch.float16:
+
+            try:
+
+                return ControlNetModel.from_pretrained(model_id, variant="fp16", **kwargs).to(DEVICE)
+
+            except Exception:
+
+                return ControlNetModel.from_pretrained(model_id, **kwargs).to(DEVICE)
+
+        return ControlNetModel.from_pretrained(model_id, **kwargs).to(DEVICE)
+
+
+    try:
+
+        cn = _try_load(True)
+
+    except Exception:
+
+        cn = _try_load(False)
+
 
     _controlnets[model_id] = cn
     return cn
@@ -299,8 +346,8 @@ def _get_cn_pipe(task: str, model_ids: List[str]):
         return _pipe_inpaint_cn[key]
 
     try:
+        from diffusers.pipelines.controlnet import MultiControlNetModel
         from diffusers import (
-            MultiControlNetModel,
             StableDiffusionXLControlNetPipeline,
             StableDiffusionXLControlNetImg2ImgPipeline,
             StableDiffusionXLControlNetInpaintPipeline,
@@ -386,8 +433,8 @@ def _identity_meta(identity: Optional[IdentityConditioning]) -> Optional[Dict[st
 class Txt2ImgRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
-    width: int = 1024
-    height: int = 1024
+    width: int = DEFAULT_WIDTH
+    height: int = DEFAULT_HEIGHT
     steps: int = 30
     guidance: float = 5.0
     seed: Optional[int] = None
@@ -402,8 +449,8 @@ class Img2ImgRequest(BaseModel):
     init_image_url: Optional[str] = None
     init_image_b64: Optional[str] = None
 
-    width: int = 1024
-    height: int = 1024
+    width: int = DEFAULT_WIDTH
+    height: int = DEFAULT_HEIGHT
     steps: int = 30
     guidance: float = 5.0
     strength: float = 0.6
@@ -422,8 +469,8 @@ class InpaintRequest(BaseModel):
     mask_image_url: Optional[str] = None
     mask_image_b64: Optional[str] = None
 
-    width: int = 1024
-    height: int = 1024
+    width: int = DEFAULT_WIDTH
+    height: int = DEFAULT_HEIGHT
     steps: int = 30
     guidance: float = 5.0
     strength: float = 0.75
@@ -476,9 +523,11 @@ def _run_txt2img(job_id: str, req: Txt2ImgRequest):
         ends: List[float] = []
 
         for ci in controls:
-            if not ci.model_id:
+            mid = ci.model_id or _default_controlnet_id(ci.type)
+            if not mid:
                 raise ValueError("each control_inputs item requires model_id")
-            model_ids.append(ci.model_id)
+            ci.model_id = mid
+            model_ids.append(mid)
             if (ci.image_url is None) == (ci.image_b64 is None):
                 raise ValueError("txt2img control_inputs requires exactly one of image_url or image_b64 per control")
             src = _load_imgref(ci.image_url, ci.image_b64)
@@ -548,9 +597,11 @@ def _run_img2img(job_id: str, req: Img2ImgRequest):
         ends: List[float] = []
 
         for ci in controls:
-            if not ci.model_id:
+            mid = ci.model_id or _default_controlnet_id(ci.type)
+            if not mid:
                 raise ValueError("each control_inputs item requires model_id")
-            model_ids.append(ci.model_id)
+            ci.model_id = mid
+            model_ids.append(mid)
 
             # If control image omitted and preprocess=True, use init image as source.
             if ci.image_url is None and ci.image_b64 is None:
@@ -632,9 +683,11 @@ def _run_inpaint(job_id: str, req: InpaintRequest):
         ends: List[float] = []
 
         for ci in controls:
-            if not ci.model_id:
+            mid = ci.model_id or _default_controlnet_id(ci.type)
+            if not mid:
                 raise ValueError("each control_inputs item requires model_id")
-            model_ids.append(ci.model_id)
+            ci.model_id = mid
+            model_ids.append(mid)
 
             if ci.image_url is None and ci.image_b64 is None:
                 if not ci.preprocess:
